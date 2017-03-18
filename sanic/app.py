@@ -1,24 +1,26 @@
 import logging
 import re
 import warnings
-from asyncio import get_event_loop
+from asyncio import get_event_loop, ensure_future, CancelledError
 from collections import deque, defaultdict
 from functools import partial
 from inspect import isawaitable, stack, getmodulename
 from traceback import format_exc
 from urllib.parse import urlencode, urlunparse
+from ssl import create_default_context
 
 from sanic.config import Config
 from sanic.constants import HTTP_METHODS
 from sanic.exceptions import ServerError, URLBuildError, SanicException
 from sanic.handlers import ErrorHandler
 from sanic.log import log
-from sanic.response import HTTPResponse
+from sanic.response import HTTPResponse, StreamingHTTPResponse
 from sanic.router import Router
 from sanic.server import serve, serve_multiple, HttpProtocol
 from sanic.static import register as static_register
-from sanic.testing import TestClient
+from sanic.testing import SanicTestClient
 from sanic.views import CompositionView
+from sanic.websocket import WebSocketProtocol, ConnectionClosed
 
 
 class Sanic:
@@ -51,6 +53,8 @@ class Sanic:
         self.sock = None
         self.listeners = defaultdict(list)
         self.is_running = False
+        self.websocket_enabled = False
+        self.websocket_tasks = []
 
         # Register alternative method names
         self.go_fast = self.run
@@ -98,7 +102,8 @@ class Sanic:
         return decorator
 
     # Decorator
-    def route(self, uri, methods=frozenset({'GET'}), host=None):
+    def route(self, uri, methods=frozenset({'GET'}), host=None,
+              strict_slashes=False):
         """Decorate a function to be registered as a route
 
         :param uri: path of the URL
@@ -114,34 +119,42 @@ class Sanic:
 
         def response(handler):
             self.router.add(uri=uri, methods=methods, handler=handler,
-                            host=host)
+                            host=host, strict_slashes=strict_slashes)
             return handler
 
         return response
 
     # Shorthand method decorators
-    def get(self, uri, host=None):
-        return self.route(uri, methods=frozenset({"GET"}), host=host)
+    def get(self, uri, host=None, strict_slashes=False):
+        return self.route(uri, methods=frozenset({"GET"}), host=host,
+                          strict_slashes=strict_slashes)
 
-    def post(self, uri, host=None):
-        return self.route(uri, methods=frozenset({"POST"}), host=host)
+    def post(self, uri, host=None, strict_slashes=False):
+        return self.route(uri, methods=frozenset({"POST"}), host=host,
+                          strict_slashes=strict_slashes)
 
-    def put(self, uri, host=None):
-        return self.route(uri, methods=frozenset({"PUT"}), host=host)
+    def put(self, uri, host=None, strict_slashes=False):
+        return self.route(uri, methods=frozenset({"PUT"}), host=host,
+                          strict_slashes=strict_slashes)
 
-    def head(self, uri, host=None):
-        return self.route(uri, methods=frozenset({"HEAD"}), host=host)
+    def head(self, uri, host=None, strict_slashes=False):
+        return self.route(uri, methods=frozenset({"HEAD"}), host=host,
+                          strict_slashes=strict_slashes)
 
-    def options(self, uri, host=None):
-        return self.route(uri, methods=frozenset({"OPTIONS"}), host=host)
+    def options(self, uri, host=None, strict_slashes=False):
+        return self.route(uri, methods=frozenset({"OPTIONS"}), host=host,
+                          strict_slashes=strict_slashes)
 
-    def patch(self, uri, host=None):
-        return self.route(uri, methods=frozenset({"PATCH"}), host=host)
+    def patch(self, uri, host=None, strict_slashes=False):
+        return self.route(uri, methods=frozenset({"PATCH"}), host=host,
+                          strict_slashes=strict_slashes)
 
-    def delete(self, uri, host=None):
-        return self.route(uri, methods=frozenset({"DELETE"}), host=host)
+    def delete(self, uri, host=None, strict_slashes=False):
+        return self.route(uri, methods=frozenset({"DELETE"}), host=host,
+                          strict_slashes=strict_slashes)
 
-    def add_route(self, handler, uri, methods=frozenset({'GET'}), host=None):
+    def add_route(self, handler, uri, methods=frozenset({'GET'}), host=None,
+                  strict_slashes=False):
         """A helper method to register class instance or
         functions as a handler to the application url
         routes.
@@ -165,8 +178,70 @@ class Sanic:
         if isinstance(handler, CompositionView):
             methods = handler.handlers.keys()
 
-        self.route(uri=uri, methods=methods, host=host)(handler)
+        self.route(uri=uri, methods=methods, host=host,
+                   strict_slashes=strict_slashes)(handler)
         return handler
+
+    # Decorator
+    def websocket(self, uri, host=None, strict_slashes=False):
+        """Decorate a function to be registered as a websocket route
+        :param uri: path of the URL
+        :param host:
+        :return: decorated function
+        """
+        self.enable_websocket()
+
+        # Fix case where the user did not prefix the URL with a /
+        # and will probably get confused as to why it's not working
+        if not uri.startswith('/'):
+            uri = '/' + uri
+
+        def response(handler):
+            async def websocket_handler(request, *args, **kwargs):
+                request.app = self
+                protocol = request.transport.get_protocol()
+                ws = await protocol.websocket_handshake(request)
+
+                # schedule the application handler
+                # its future is kept in self.websocket_tasks in case it
+                # needs to be cancelled due to the server being stopped
+                fut = ensure_future(handler(request, ws, *args, **kwargs))
+                self.websocket_tasks.append(fut)
+                try:
+                    await fut
+                except (CancelledError, ConnectionClosed):
+                    pass
+                self.websocket_tasks.remove(fut)
+                await ws.close()
+
+            self.router.add(uri=uri, handler=websocket_handler,
+                            methods=frozenset({'GET'}), host=host,
+                            strict_slashes=strict_slashes)
+            return handler
+
+        return response
+
+    def add_websocket_route(self, handler, uri, host=None,
+                            strict_slashes=False):
+        """A helper method to register a function as a websocket route."""
+        return self.websocket(uri, host=host,
+                              strict_slashes=strict_slashes)(handler)
+
+    def enable_websocket(self, enable=True):
+        """Enable or disable the support for websocket.
+
+        Websocket is enabled automatically if websocket routes are
+        added to the application.
+        """
+        if not self.websocket_enabled:
+            # if the server is stopped, we want to cancel any ongoing
+            # websocket tasks, to allow the server to exit promptly
+            @self.listener('before_server_stop')
+            def cancel_websocket_tasks(app, loop):
+                for task in self.websocket_tasks:
+                    task.cancel()
+
+        self.websocket_enabled = enable
 
     def remove_route(self, uri, clean_cache=True, host=None):
         self.router.remove(uri, clean_cache, host)
@@ -181,7 +256,11 @@ class Sanic:
 
         def response(handler):
             for exception in exceptions:
-                self.error_handler.add(exception, handler)
+                if isinstance(exception, (tuple, list)):
+                    for e in exception:
+                        self.error_handler.add(e, handler)
+                else:
+                    self.error_handler.add(exception, handler)
             return handler
 
         return response
@@ -254,7 +333,7 @@ class Sanic:
         the output URL's query string.
 
         :param view_name: string referencing the view name
-        :param **kwargs: keys and values that are used to build request
+        :param \*\*kwargs: keys and values that are used to build request
             parameters and query string arguments.
 
         :return: the built URL
@@ -269,6 +348,9 @@ class Sanic:
             raise URLBuildError(
                     'Endpoint with name `{}` was not found'.format(
                         view_name))
+
+        if uri != '/' and uri.endswith('/'):
+            uri = uri[:-1]
 
         out = uri
 
@@ -342,20 +424,25 @@ class Sanic:
     def converted_response_type(self, response):
         pass
 
-    async def handle_request(self, request, response_callback):
+    async def handle_request(self, request, write_callback, stream_callback):
         """Take a request from the HTTP Server and return a response object
         to be sent back The HTTP Server only expects a response object, so
         exception handling must be done here
 
         :param request: HTTP Request object
-        :param response_callback: Response function to be called with the
-                                  response as the only argument
+        :param write_callback: Synchronous response function to be
+            called with the response as the only argument
+        :param stream_callback: Coroutine that handles streaming a
+            StreamingHTTPResponse if produced by the handler.
+
         :return: Nothing
         """
         try:
             # -------------------------------------------- #
             # Request Middleware
             # -------------------------------------------- #
+
+            request.app = self
 
             response = False
             # The if improves speed.  I don't know why
@@ -416,7 +503,11 @@ class Sanic:
                     response = HTTPResponse(
                         "An error occurred while handling an error")
 
-        response_callback(response)
+        # pass the response to the correct callback
+        if isinstance(response, StreamingHTTPResponse):
+            await stream_callback(response)
+        else:
+            write_callback(response)
 
     # -------------------------------------------------------------------- #
     # Testing
@@ -424,7 +515,7 @@ class Sanic:
 
     @property
     def test_client(self):
-        return TestClient(self)
+        return SanicTestClient(self)
 
     # -------------------------------------------------------------------- #
     # Execution
@@ -432,7 +523,7 @@ class Sanic:
 
     def run(self, host="127.0.0.1", port=8000, debug=False, before_start=None,
             after_start=None, before_stop=None, after_stop=None, ssl=None,
-            sock=None, workers=1, loop=None, protocol=HttpProtocol,
+            sock=None, workers=1, loop=None, protocol=None,
             backlog=100, stop_event=None, register_sys_signals=True):
         """Run the HTTP Server and listen until keyboard interrupt or term
         signal. On termination, drain connections before closing.
@@ -441,17 +532,18 @@ class Sanic:
         :param port: Port to host on
         :param debug: Enables debug output (slows server)
         :param before_start: Functions to be executed before the server starts
-                             accepting connections
+                            accepting connections
         :param after_start: Functions to be executed after the server starts
                             accepting connections
         :param before_stop: Functions to be executed when a stop signal is
                             received before it is respected
         :param after_stop: Functions to be executed when all requests are
-                           complete
-        :param ssl: SSLContext for SSL encryption of worker(s)
+                            complete
+        :param ssl: SSLContext, or location of certificate and key
+                            for SSL encryption of worker(s)
         :param sock: Socket for the server to accept connections from
         :param workers: Number of processes
-                        received before it is respected
+                            received before it is respected
         :param loop:
         :param backlog:
         :param stop_event:
@@ -459,6 +551,9 @@ class Sanic:
         :param protocol: Subclass of asyncio protocol class
         :return: Nothing
         """
+        if protocol is None:
+            protocol = (WebSocketProtocol if self.websocket_enabled
+                        else HttpProtocol)
         server_settings = self._helper(
             host=host, port=port, debug=debug, before_start=before_start,
             after_start=after_start, before_stop=before_stop,
@@ -486,13 +581,16 @@ class Sanic:
     async def create_server(self, host="127.0.0.1", port=8000, debug=False,
                             before_start=None, after_start=None,
                             before_stop=None, after_stop=None, ssl=None,
-                            sock=None, loop=None, protocol=HttpProtocol,
+                            sock=None, loop=None, protocol=None,
                             backlog=100, stop_event=None):
         """Asynchronous version of `run`.
 
         NOTE: This does not support multiprocessing and is not the preferred
               way to run a Sanic application.
         """
+        if protocol is None:
+            protocol = (WebSocketProtocol if self.websocket_enabled
+                        else HttpProtocol)
         server_settings = self._helper(
             host=host, port=port, debug=debug, before_start=before_start,
             after_start=after_start, before_stop=before_stop,
@@ -509,6 +607,16 @@ class Sanic:
                 protocol=HttpProtocol, backlog=100, stop_event=None,
                 register_sys_signals=True, run_async=False):
         """Helper function used by `run` and `create_server`."""
+
+        if isinstance(ssl, dict):
+            # try common aliaseses
+            cert = ssl.get('cert') or ssl.get('certificate')
+            key = ssl.get('key') or ssl.get('keyfile')
+            if not cert and key:
+                raise ValueError("SSLContext or certificate and key required.")
+            context = create_default_context(purpose=ssl.Purpose.CLIENT_AUTH)
+            context.load_cert_chain(cert, keyfile=key)
+            ssl = context
 
         if loop is not None:
             if debug:

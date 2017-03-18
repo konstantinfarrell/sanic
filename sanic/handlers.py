@@ -34,7 +34,7 @@ class ErrorHandler:
             exc_name=exc_type.__name__,
             exc_value=exc_value,
             frame_html=''.join(frame_html),
-            uri=request.url)
+            path=request.path)
 
     def add(self, exception, handler):
         self.handlers[exception] = handler
@@ -53,10 +53,11 @@ class ErrorHandler:
         except Exception:
             self.log(format_exc())
             if self.debug:
+                url = getattr(request, 'url', 'unknown')
                 response_message = (
                     'Exception raised in exception handler "{}" '
                     'for uri: "{}"\n{}').format(
-                        handler.__name__, request.url, format_exc())
+                        handler.__name__, url, format_exc())
                 log.error(response_message)
                 return text(response_message, 500)
             else:

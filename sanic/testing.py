@@ -4,7 +4,7 @@ HOST = '127.0.0.1'
 PORT = 42101
 
 
-class TestClient:
+class SanicTestClient:
     def __init__(self, app):
         self.app = app
 
@@ -17,7 +17,9 @@ class TestClient:
                 host=HOST, port=PORT, uri=uri)
 
         log.info(url)
-        async with aiohttp.ClientSession(cookies=cookies) as session:
+        conn = aiohttp.TCPConnector(verify_ssl=False)
+        async with aiohttp.ClientSession(
+                cookies=cookies, connector=conn) as session:
             async with getattr(
                     session, method.lower())(url, *args, **kwargs) as response:
                 response.text = await response.text()
@@ -45,7 +47,7 @@ class TestClient:
                     **request_kwargs)
                 results[-1] = response
             except Exception as e:
-                exceptions.self.append(e)
+                exceptions.append(e)
             self.app.stop()
 
         self.app.run(host=HOST, debug=debug, port=PORT, **server_kwargs)

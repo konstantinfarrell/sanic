@@ -159,20 +159,28 @@ class HttpProtocol(asyncio.Protocol):
     def on_message_complete(self):
         if self.request.body:
             self.request.body = b''.join(self.request.body)
+
         self._request_handler_task = self.loop.create_task(
-            self.request_handler(self.request, self.write_response))
+            self.request_handler(
+                self.request,
+                self.write_response,
+                self.stream_response))
 
     # -------------------------------------------- #
     # Responding
     # -------------------------------------------- #
-
     def write_response(self, response):
-        keep_alive = (
-            self.parser.should_keep_alive() and not self.signal.stopped)
+        """
+        Writes response content synchronously to the transport.
+        """
         try:
+            keep_alive = (
+                self.parser.should_keep_alive() and not self.signal.stopped)
+
             self.transport.write(
                 response.output(
-                    self.request.version, keep_alive, self.request_timeout))
+                    self.request.version, keep_alive,
+                    self.request_timeout))
         except AttributeError:
             log.error(
                 ('Invalid response object for url {}, '
@@ -191,7 +199,41 @@ class HttpProtocol(asyncio.Protocol):
             if not keep_alive:
                 self.transport.close()
             else:
-                # Record that we received data
+                self._last_request_time = current_time
+                self.cleanup()
+
+    async def stream_response(self, response):
+        """
+        Streams a response to the client asynchronously. Attaches
+        the transport to the response so the response consumer can
+        write to the response as needed.
+        """
+
+        try:
+            keep_alive = (
+                self.parser.should_keep_alive() and not self.signal.stopped)
+
+            response.transport = self.transport
+            await response.stream(
+                self.request.version, keep_alive, self.request_timeout)
+        except AttributeError:
+            log.error(
+                ('Invalid response object for url {}, '
+                 'Expected Type: HTTPResponse, Actual Type: {}').format(
+                    self.url, type(response)))
+            self.write_error(ServerError('Invalid response type'))
+        except RuntimeError:
+            log.error(
+                'Connection lost before response written @ {}'.format(
+                    self.request.ip))
+        except Exception as e:
+            self.bail_out(
+                "Writing response failed, connection closed {}".format(
+                    repr(e)))
+        finally:
+            if not keep_alive:
+                self.transport.close()
+            else:
                 self._last_request_time = current_time
                 self.cleanup()
 
@@ -212,7 +254,7 @@ class HttpProtocol(asyncio.Protocol):
             self.transport.close()
 
     def bail_out(self, message, from_error=False):
-        if from_error and self.transport.is_closing():
+        if from_error or self.transport.is_closing():
             log.error(
                 ("Transport closed @ {} and exception "
                  "experienced during error handling").format(
@@ -287,7 +329,7 @@ def serve(host, port, request_handler, error_handler, before_start=None,
                         `app` instance and `loop`
     :param after_stop: function to be executed when a stop signal is
                        received after it is respected. Takes arguments
-                        `app` instance and `loop`
+                       `app` instance and `loop`
     :param debug: enables debug output (slows server)
     :param request_timeout: time in seconds
     :param ssl: SSLContext
@@ -396,13 +438,15 @@ def serve_multiple(server_settings, workers, stop_event=None):
                       " has more information.", DeprecationWarning)
     server_settings['reuse_port'] = True
 
-    sock = socket()
-    sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
-    sock.bind((server_settings['host'], server_settings['port']))
-    set_inheritable(sock.fileno(), True)
-    server_settings['sock'] = sock
-    server_settings['host'] = None
-    server_settings['port'] = None
+    # Handling when custom socket is not provided.
+    if server_settings.get('sock') is None:
+        sock = socket()
+        sock.setsockopt(SOL_SOCKET, SO_REUSEADDR, 1)
+        sock.bind((server_settings['host'], server_settings['port']))
+        set_inheritable(sock.fileno(), True)
+        server_settings['sock'] = sock
+        server_settings['host'] = None
+        server_settings['port'] = None
 
     if stop_event is None:
         stop_event = Event()
@@ -423,6 +467,6 @@ def serve_multiple(server_settings, workers, stop_event=None):
     # the above processes will block this until they're stopped
     for process in processes:
         process.terminate()
-    sock.close()
+    server_settings.get('sock').close()
 
     asyncio.get_event_loop().stop()

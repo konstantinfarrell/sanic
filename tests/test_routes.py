@@ -1,3 +1,4 @@
+import asyncio
 import pytest
 
 from sanic import Sanic
@@ -21,6 +22,42 @@ def test_shorthand_routes_get():
 
     request, response = app.test_client.post('/get')
     assert response.status == 405
+
+def test_route_strict_slash():
+    app = Sanic('test_route_strict_slash')
+
+    @app.get('/get', strict_slashes=True)
+    def handler(request):
+        return text('OK')
+
+    @app.post('/post/', strict_slashes=True)
+    def handler(request):
+        return text('OK')
+
+    request, response = app.test_client.get('/get')
+    assert response.text == 'OK'
+
+    request, response = app.test_client.get('/get/')
+    assert response.status == 404
+
+    request, response = app.test_client.post('/post/')
+    assert response.text == 'OK'
+
+    request, response = app.test_client.post('/post')
+    assert response.status == 404
+
+def test_route_optional_slash():
+    app = Sanic('test_route_optional_slash')
+
+    @app.get('/get')
+    def handler(request):
+        return text('OK')
+
+    request, response = app.test_client.get('/get')
+    assert response.text == 'OK'
+
+    request, response = app.test_client.get('/get/')
+    assert response.text == 'OK'
 
 def test_shorthand_routes_post():
     app = Sanic('test_shorhand_routes_post')
@@ -219,6 +256,23 @@ def test_dynamic_route_unhashable():
 
     request, response = app.test_client.get('/folder/test/nope/')
     assert response.status == 404
+
+
+def test_websocket_route():
+    app = Sanic('test_websocket_route')
+    ev = asyncio.Event()
+
+    @app.websocket('/ws')
+    async def handler(request, ws):
+        ev.set()
+
+    request, response = app.test_client.get('/ws', headers={
+        'Upgrade': 'websocket',
+        'Connection': 'upgrade',
+        'Sec-WebSocket-Key': 'dGhlIHNhbXBsZSBub25jZQ==',
+        'Sec-WebSocket-Version': '13'})
+    assert response.status == 101
+    assert ev.is_set()
 
 
 def test_route_duplicate():
@@ -484,6 +538,19 @@ def test_remove_inexistent_route():
 
     with pytest.raises(RouteDoesNotExist):
         app.remove_route('/test')
+
+def test_removing_slash():
+    app = Sanic(__name__)
+
+    @app.get('/rest/<resource>')
+    def get(_):
+        pass
+
+    @app.post('/rest/<resource>')
+    def post(_):
+        pass
+
+    assert len(app.router.routes_all.keys()) == 2
 
 
 def test_remove_unhashable_route():

@@ -75,9 +75,10 @@ class Router:
         """Parse a parameter string into its constituent name, type, and
         pattern
 
-        For example:
-        `parse_parameter_string('<param_one:[A-z]>')` ->
-            ('param_one', str, '[A-z]')
+        For example::
+
+            parse_parameter_string('<param_one:[A-z]>')` ->
+                ('param_one', str, '[A-z]')
 
         :param parameter_string: String to parse
         :return: tuple containing
@@ -95,7 +96,32 @@ class Router:
 
         return name, _type, pattern
 
-    def add(self, uri, methods, handler, host=None):
+    def add(self, uri, methods, handler, host=None, strict_slashes=False):
+
+        # add regular version
+        self._add(uri, methods, handler, host)
+
+        if strict_slashes:
+            return
+
+        # Add versions with and without trailing /
+        slash_is_missing = (
+            not uri[-1] == '/'
+            and not self.routes_all.get(uri + '/', False)
+        )
+        without_slash_is_missing = (
+            uri[-1] == '/'
+            and not self.routes_all.get(uri[:-1], False)
+            and not uri == '/'
+        )
+        # add version with trailing slash
+        if slash_is_missing:
+            self._add(uri + '/', methods, handler, host)
+        # add version without trailing slash
+        elif without_slash_is_missing:
+            self._add(uri[:-1], methods, handler, host)
+
+    def _add(self, uri, methods, handler, host=None):
         """Add a handler to the route list
 
         :param uri: path to match
@@ -105,7 +131,6 @@ class Router:
             When executed, it should provide a response object.
         :return: Nothing
         """
-
         if host is not None:
             if isinstance(host, str):
                 uri = host + uri
@@ -258,16 +283,16 @@ class Router:
         :param request: Request object
         :return: handler, arguments, keyword arguments
         """
-        # Note - this means that if _any_ routes specify host, non-host routes
-        # will typically fail as they are looked up by host
-        # fix - check if host is in host-based routing table (perhaps) or
-        # better, get candidate of routes and then dispatch by host.
-        # This may have perf issues.
+        # No virtual hosts specified; default behavior
         if not self.hosts:
-            return self._get(request.url, request.method, '')
-        else:
-            return self._get(request.url, request.method,
+            return self._get(request.path, request.method, '')
+        # virtual hosts specified; try to match route to the host header
+        try:
+            return self._get(request.path, request.method,
                              request.headers.get("Host", ''))
+        # try default hosts
+        except NotFound:
+            return self._get(request.path, request.method, '')
 
     @lru_cache(maxsize=ROUTER_CACHE_SIZE)
     def _get(self, url, method, host):

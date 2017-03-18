@@ -69,6 +69,29 @@ The following variables are accessible as properties on `Request` objects:
   
 - `ip` (str) - IP address of the requester.
 
+- `app` - a reference to the Sanic application object that is handling this request. This is useful when inside blueprints or other handlers in modules that do not have access to the global `app` object.
+
+  ```python
+  from sanic.response import json
+  from sanic import Blueprint
+
+  bp = Blueprint('my_blueprint')
+
+  @bp.route('/')
+  async def bp_root(request):
+      if request.app.config['DEBUG']:
+          return json({'status': 'debug'})
+      else:
+          return json({'status': 'production'})
+
+  ```
+- `url`: The full URL of the request, ie: `http://localhost:8000/posts/1/?foo=bar`
+- `scheme`: The URL scheme associated with the request: `http` or `https`
+- `host`: The host associated with the request: `localhost:8080`
+- `path`: The path of the request: `/posts/1/`
+- `query_string`: The query string of the request: `foo=bar` or a blank string `''`
+
+
 ## Accessing values using `get` and `getlist`
 
 The request properties which return a dictionary actually return a subclass of

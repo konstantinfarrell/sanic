@@ -2,7 +2,7 @@ from cgi import parse_header
 from collections import namedtuple
 from http.cookies import SimpleCookie
 from httptools import parse_url
-from urllib.parse import parse_qs
+from urllib.parse import parse_qs, urlunparse
 
 try:
     from ujson import loads as json_loads
@@ -36,23 +36,20 @@ class RequestParameters(dict):
 class Request(dict):
     """Properties of an HTTP request such as URL, headers, etc."""
     __slots__ = (
-        'url', 'headers', 'version', 'method', '_cookies', 'transport',
-        'query_string', 'body',
-        'parsed_json', 'parsed_args', 'parsed_form', 'parsed_files',
-        '_ip',
+        'app', 'headers', 'version', 'method', '_cookies', 'transport',
+        'body', 'parsed_json', 'parsed_args', 'parsed_form', 'parsed_files',
+        '_ip', '_parsed_url',
     )
 
     def __init__(self, url_bytes, headers, version, method, transport):
         # TODO: Content-Encoding detection
-        url_parsed = parse_url(url_bytes)
-        self.url = url_parsed.path.decode('utf-8')
+        self._parsed_url = parse_url(url_bytes)
+        self.app = None
+
         self.headers = headers
         self.version = version
         self.method = method
         self.transport = transport
-        self.query_string = None
-        if url_parsed.query:
-            self.query_string = url_parsed.query.decode('utf-8')
 
         # Init but do not inhale
         self.body = []
@@ -68,6 +65,8 @@ class Request(dict):
             try:
                 self.parsed_json = json_loads(self.body)
             except Exception:
+                if not self.body:
+                    return None
                 raise InvalidUsage("Failed when parsing body as json")
 
         return self.parsed_json
@@ -140,6 +139,46 @@ class Request(dict):
         if not hasattr(self, '_ip'):
             self._ip = self.transport.get_extra_info('peername')
         return self._ip
+
+    @property
+    def scheme(self):
+        if self.app.websocket_enabled \
+                and self.headers.get('upgrade') == 'websocket':
+            scheme = 'ws'
+        else:
+            scheme = 'http'
+
+        if self.transport.get_extra_info('sslcontext'):
+            scheme += 's'
+
+        return scheme
+
+    @property
+    def host(self):
+        # it appears that httptools doesn't return the host
+        # so pull it from the headers
+        return self.headers.get('Host', '')
+
+    @property
+    def path(self):
+        return self._parsed_url.path.decode('utf-8')
+
+    @property
+    def query_string(self):
+        if self._parsed_url.query:
+            return self._parsed_url.query.decode('utf-8')
+        else:
+            return ''
+
+    @property
+    def url(self):
+        return urlunparse((
+            self.scheme,
+            self.host,
+            self.path,
+            None,
+            self.query_string,
+            None))
 
 
 File = namedtuple('File', ['type', 'body', 'name'])

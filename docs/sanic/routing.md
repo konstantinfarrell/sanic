@@ -81,6 +81,19 @@ async def get_handler(request):
 
 ```
 
+There is also an optional `host` argument (which can be a list or a string). This restricts a route to the host or hosts provided. If there is a also a route with no host, it will be the default.
+
+```python
+@app.route('/get', methods=['GET'], host='example.com')
+async def get_handler(request):
+	return text('GET request - {}'.format(request.args))
+
+# if the host header doesn't match example.com, this route will be used
+@app.route('/get', methods=['GET'])
+async def get_handler(request):
+	return text('GET request in default - {}'.format(request.args))
+```
+
 There are also shorthand method decorators:
 
 ```python
@@ -169,7 +182,36 @@ url = app.url_for('post_handler', post_id=5, arg_one=['one', 'two'], arg_two=2, 
 ```
 - All valid parameters must be passed to `url_for` to build a URL. If a parameter is not supplied, or if a parameter does not match the specified type, a `URLBuildError` will be thrown.
 
+## WebSocket routes
 
+Routes for the WebSocket protocol can be defined with the `@app.websocket`
+decorator:
 
+```python
+@app.websocket('/feed')
+async def feed(request, ws):
+    while True:
+        data = 'hello!'
+        print('Sending: ' + data)
+        await ws.send(data)
+        data = await ws.recv()
+        print('Received: ' + data)
+```
 
+Alternatively, the `app.add_websocket_route` method can be used instead of the
+decorator:
+
+```python
+async def feed(request, ws):
+    pass
+
+app.add_websocket_route(my_websocket_handler, '/feed')
+```
+
+Handlers for a WebSocket route are passed the request as first argument, and a
+WebSocket protocol object as second argument. The protocol object has `send`
+and `recv` methods to send and receive data respectively.
+
+WebSocket support requires the [websockets](https://github.com/aaugustin/websockets)
+package by Aymeric Augustin.
 
